@@ -132,13 +132,42 @@ const size_t IoTHubClient_ThreadTerminationOffset = offsetof(IOTHUB_CLIENT_INSTA
 static void garbageCollectorImpl(IOTHUB_CLIENT_INSTANCE* iotHubClientInstance)
 {
     /*see if any savedData structures can be disposed of*/
-    /*Codes_SRS_IOTHUBCLIENT_02_072: [ All threads marked as disposable (upon completion of a file upload) shall be joined and the data structures build for them shall be freed. ]*/
-    LIST_ITEM_HANDLE item = singlylinkedlist_get_head_item(iotHubClientInstance->savedDataToBeCleaned);
+    LIST_ITEM_HANDLE item;
+
+    if (Lock(iotHubClientInstance->LockHandle) != LOCK_OK)
+    {
+        LogError("Could not acquire lock");
+        item = NULL;
+    }
+    else
+    {
+        /*Codes_SRS_IOTHUBCLIENT_02_072: [ All threads marked as disposable (upon completion of a file upload) shall be joined and the data structures build for them shall be freed. ]*/
+        item = singlylinkedlist_get_head_item(iotHubClientInstance->savedDataToBeCleaned);
+
+        if (Unlock(iotHubClientInstance->LockHandle) != LOCK_OK)
+        {
+            LogError("Could not release lock");
+        }
+    }
+
     while (item != NULL)
     {
         const UPLOADTOBLOB_SAVED_DATA* savedData = (const UPLOADTOBLOB_SAVED_DATA*)singlylinkedlist_item_get_value(item);
         LIST_ITEM_HANDLE old_item = item;
-        item = singlylinkedlist_get_next_item(item);
+
+        if (Lock(iotHubClientInstance->LockHandle) != LOCK_OK)
+        {
+            LogError("Could not acquire lock");
+        }
+        else
+        {
+            item = singlylinkedlist_get_next_item(item);
+
+            if (Unlock(iotHubClientInstance->LockHandle) != LOCK_OK)
+            {
+                LogError("Could not release lock");
+            }
+        }
 
         if (Lock(savedData->lockGarbage) != LOCK_OK)
         {
@@ -153,7 +182,21 @@ static void garbageCollectorImpl(IOTHUB_CLIENT_INSTANCE* iotHubClientInstance)
                 {
                     LogError("unable to ThreadAPI_Join");
                 }
-                (void)singlylinkedlist_remove(iotHubClientInstance->savedDataToBeCleaned, old_item);
+
+                if (Lock(iotHubClientInstance->LockHandle) != LOCK_OK)
+                {
+                    LogError("Could not acquire lock");
+                }
+                else
+                {
+                    (void)singlylinkedlist_remove(iotHubClientInstance->savedDataToBeCleaned, old_item);
+
+                    if (Unlock(iotHubClientInstance->LockHandle) != LOCK_OK)
+                    {
+                        LogError("Could not release lock");
+                    }
+                }
+                
                 free((void*)savedData->source);
                 free((void*)savedData->destinationFileName);
 
@@ -577,9 +620,6 @@ static int ScheduleWork_Thread(void* threadArgument)
                 /* Codes_SRS_IOTHUBCLIENT_01_039: [All calls to IoTHubClient_LL_DoWork shall be protected by the lock created in IotHubClient_Create.] */
                 IoTHubClient_LL_DoWork(iotHubClientInstance->IoTHubClientLLHandle);
 
-#ifndef DONT_USE_UPLOADTOBLOB
-                garbageCollectorImpl(iotHubClientInstance);
-#endif
                 VECTOR_HANDLE call_backs = VECTOR_move(iotHubClientInstance->saved_user_callback_list);
                 (void)Unlock(iotHubClientInstance->LockHandle);
                 if (call_backs == NULL)
@@ -590,6 +630,10 @@ static int ScheduleWork_Thread(void* threadArgument)
                 {
                     dispatch_user_callbacks(iotHubClientInstance, call_backs);
                 }
+
+#ifndef DONT_USE_UPLOADTOBLOB
+                garbageCollectorImpl(iotHubClientInstance);
+#endif
             }
         }
         else
@@ -862,14 +906,6 @@ void IoTHubClient_Destroy(IOTHUB_CLIENT_HANDLE iotHubClientHandle)
             LogError("unable to Lock - - will still proceed to try to end the thread without locking");
         }
 
-#ifndef DONT_USE_UPLOADTOBLOB
-        /*Codes_SRS_IOTHUBCLIENT_02_069: [ IoTHubClient_Destroy shall free all data created by IoTHubClient_UploadToBlobAsync ]*/
-        /*wait for all uploading threads to finish*/
-        while (singlylinkedlist_get_head_item(iotHubClientInstance->savedDataToBeCleaned) != NULL)
-        {
-            garbageCollectorImpl(iotHubClientInstance);
-        }
-#endif
         if (iotHubClientInstance->ThreadHandle != NULL)
         {
             iotHubClientInstance->StopThread = 1;
@@ -880,17 +916,34 @@ void IoTHubClient_Destroy(IOTHUB_CLIENT_HANDLE iotHubClientHandle)
             okToJoin = false;
         }
 
-        /* Codes_SRS_IOTHUBCLIENT_01_006: [That includes destroying the IoTHubClient_LL instance by calling IoTHubClient_LL_Destroy.] */
-        IoTHubClient_LL_Destroy(iotHubClientInstance->IoTHubClientLLHandle);
+        /*Codes_SRS_IOTHUBCLIENT_02_045: [ IoTHubClient_Destroy shall unlock the serializing lock. ]*/
+        if (Unlock(iotHubClientInstance->LockHandle) != LOCK_OK)
+        {
+            LogError("unable to Unlock");
+        }
 
 #ifndef DONT_USE_UPLOADTOBLOB
         if (iotHubClientInstance->savedDataToBeCleaned != NULL)
         {
+            /*Codes_SRS_IOTHUBCLIENT_02_069: [ IoTHubClient_Destroy shall free all data created by IoTHubClient_UploadToBlobAsync ]*/
+            /*wait for all uploading threads to finish*/
+            while (singlylinkedlist_get_head_item(iotHubClientInstance->savedDataToBeCleaned) != NULL)
+            {
+                garbageCollectorImpl(iotHubClientInstance);
+            }
+
             singlylinkedlist_destroy(iotHubClientInstance->savedDataToBeCleaned);
         }
 #endif
 
-        /*Codes_SRS_IOTHUBCLIENT_02_045: [ IoTHubClient_Destroy shall unlock the serializing lock. ]*/
+        if (Lock(iotHubClientInstance->LockHandle) != LOCK_OK)
+        {
+            LogError("unable to Lock - - will still proceed to try to end the thread without locking");
+        }
+
+        /* Codes_SRS_IOTHUBCLIENT_01_006: [That includes destroying the IoTHubClient_LL instance by calling IoTHubClient_LL_Destroy.] */
+        IoTHubClient_LL_Destroy(iotHubClientInstance->IoTHubClientLLHandle);
+
         if (Unlock(iotHubClientInstance->LockHandle) != LOCK_OK)
         {
             LogError("unable to Unlock");
